@@ -1,12 +1,12 @@
-# Multi-Scale Road Hierarchy and Persistent Roads Driven Tracker
+# Multi-Scale Road Hierarchy and Persistent Roads Driven Tracker (2026-10-29)
 
-## Background & Problem Statement
+## Context & Problem Statement
 
-Issue #365 requested an in-depth map view similar to modern web cartography (e.g., Google Maps) that reveals increasing road detail as the user zooms in, alongside a persistent record of all roads driven across game sessions.
+Issue #365 requested an in-depth map view similar to modern web cartography (e.g. Google Maps) that reveals increasing road detail as the user zooms in, alongside persistent tracking of roads driven across game sessions.
 
 ### Previous Limitations
 
-1. **Uniform Map Density**: In the stock [`EarthMap.vue`](file:///c:/Users/omdevsss/Documents/GitHub/BeamNG.Earth/mod/beamng_earth/ui/ui-vue/mods/beamngEarth/EarthMap.vue), all roads were rendered with a single flat style. At zoomed-out scales, residential alleys and service ways cluttered the display into an unreadable tangle, while zoomed-in views lacked visual hierarchy between major arterials and local streets.
+1. **Uniform Map Density**: In `mod/beamng_earth/ui/ui-vue/mods/beamngEarth/EarthMap.vue`, all roads were drawn with a single uniform stroke style. At zoomed-out scales, residential alleys and service ways cluttered the display into an unreadable tangle, while zoomed-in views lacked visual hierarchy between major freeways and local streets.
 2. **Transient Exploration**: Players had no visual record of explored versus unexplored territory across the globe.
 3. **GPS Route Overlap**: The mod's built-in GPS destination breadcrumb (`routeDone`, styled as `.route-done` in muted gray) was transient: whenever a player selected a new destination or cleared the route, `clearGps()` immediately erased the traversed path.
 
@@ -14,7 +14,7 @@ Issue #365 requested an in-depth map view similar to modern web cartography (e.g
 
 ### 1. Multi-Scale Dynamic Road Hierarchy
 
-We introduced scale-dependent SVG styling and classification in `EarthMap.vue`:
+Introduced scale-dependent SVG styling and classification in `EarthMap.vue`:
 
 - **Classification by Functional Class**:
   - `motorway`, `trunk`: Major freeways and dual carriageways.
@@ -28,7 +28,7 @@ We introduced scale-dependent SVG styling and classification in `EarthMap.vue`:
 To avoid coupling with the transient GPS route, the exploration tracker is implemented as an independent persistent subsystem:
 
 - **Tracking Engine in Lua**:
-  [`mod/beamng_earth/lua/ge/extensions/beamngEarth/roads.lua`](file:///c:/Users/omdevsss/Documents/GitHub/BeamNG.Earth/mod/beamng_earth/lua/ge/extensions/beamngEarth/roads.lua) monitors vehicle traversal across mapped road segments. When the vehicle covers a road segment, its unique identifier and coordinates are recorded in an in-memory set and persisted to `/settings/beamngEarth_driven.json`.
+  `mod/beamng_earth/lua/ge/extensions/beamngEarth/roads.lua` monitors vehicle traversal across mapped road segments. When the vehicle covers a road segment, its unique identifier and coordinates are recorded in an in-memory set and persisted to `<user-settings>/beamngEarth_driven.json`.
 - **UI Exposure**:
   `settings.lua` and `roads.lua` expose `M.getDrivenSummary()` to the Vue frontend via `uiState()`.
 - **Distinct Neon Visual Layer in `EarthMap.vue`**:
