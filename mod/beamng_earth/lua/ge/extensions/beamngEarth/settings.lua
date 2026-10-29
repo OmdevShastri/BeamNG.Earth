@@ -774,6 +774,7 @@ function M.uiMapState()
     creditsByArea = core and core.creditsByArea and core.creditsByArea() or nil,
     gps = require('beamngEarth/gps').status(),
     weather = localWeatherBadge(),
+    roadsDriven = require('beamngEarth/roads_driven').uiState(),
   }
 end
 
