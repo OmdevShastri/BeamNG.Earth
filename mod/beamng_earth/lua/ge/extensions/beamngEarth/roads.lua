@@ -1321,8 +1321,11 @@ local function updateFarGeo(key, f)
   if f.lamps then farGeoLamps(f, shown) end
 end
 
-local function updateFar(gov)
-  for key, f in pairs(far) do
+-- The far tiles' hide checks, round-robin: at most FAR_CHECKS_PER_FRAME a frame (all ~600 of them every frame cost
+-- ~0.85 ms of every frame while driving, 2026-10-29; a far building shown or hidden a few frames later is not seen)
+M.FAR_CHECKS_PER_FRAME = 80
+local farCursor = nil
+local function updateFarOne(key, f)
     if f.geo then
       updateFarGeo(key, f)
     elseif f.id then
@@ -1346,6 +1349,22 @@ local function updateFar(gov)
       end
     end
     if f.lamps and not f.geo then farLamps(key, f, f.id ~= nil and not f.hidden) end
+end
+local function updateFar(gov)
+  if farCursor ~= nil and far[farCursor] == nil then farCursor = nil end     -- (gone: next() cannot go on from it)
+  local key, f = next(far, farCursor)
+  local wrapped = farCursor == nil
+  for _ = 1, M.FAR_CHECKS_PER_FRAME do
+    if key == nil then
+      farCursor = nil
+      if wrapped then break end
+      wrapped = true
+      key, f = next(far)
+      if key == nil then break end
+    end
+    updateFarOne(key, f)
+    farCursor = key
+    key, f = next(far, key)
   end
   while #farQ > 0 and #walkQ == 0 and gov:try('roadWalk') do
     local key = table.remove(farQ, 1)
@@ -1552,7 +1571,17 @@ local viewAt = nil  -- core.viewAway(): the camera's { x, y } when it is away fr
 local prewarmId, prewarmPath, prewarmWant = nil, nil, nil     -- (the materials' prewarm shape, below)
 local prewarmNow
 
+-- The last frame's update in parts (ms; diagnostics: the frame-time probes, 2026-10-29)
+M.steps = {}
+local stepClock = stopwatch.clock()
+local stepT0 = 0
+local function step(name)
+  local t = stepClock()
+  M.steps[name] = t - stepT0
+  stepT0 = t
+end
 function M.update(gov, currentAnchor, player, view, a)
+  stepT0 = stepClock()
   viewAt = view
   if a then anchorObj = a end
   if prewarmWant then prewarmNow()
@@ -1560,8 +1589,11 @@ function M.update(gov, currentAnchor, player, view, a)
     prewarmId, prewarmWant = nil, prewarmPath
   end
   if currentAnchor then switchAnchor(currentAnchor) end
+  step('anchor')
   releaseGhosts(player)
+  step('ghosts')
   if M._releaseOrphans then M._releaseOrphans(player) end
+  step('orphans')
   while #deleteQ > 0 and gov:try('roadDelete') do
     local t0 = now()
     local did = table.remove(deleteQ)
@@ -1593,8 +1625,11 @@ function M.update(gov, currentAnchor, player, view, a)
       sinceChange = stopwatch.new()
     end
   end
+  step('deletes+chunks')
   releaseHeld()
+  step('held')
   updateCollideRange()
+  step('collideRange')
   local forced = nil
   if #walkQ > 0 and sinceUrgent >= M.URGENT_EVERY_FRAMES and not (gov.isHeavyFrame and gov:isHeavyFrame()) then
     forced = M.urgentWalk(walkQ)
@@ -1646,7 +1681,9 @@ function M.update(gov, currentAnchor, player, view, a)
       sinceChange = stopwatch.new()
     end
   end
+  step('walks')
   updateFar(gov)                -- far buildings: only with the near meshes all made (they share the budget)
+  step('far')
   if swapQuiet then
     swapQuiet.frames = swapQuiet.frames - 1
     if swapQuiet.frames <= 0 and swapQuiet.since() >= M.SWAP_QUIET_MS then swapQuiet = nil end
@@ -1671,6 +1708,7 @@ function M.update(gov, currentAnchor, player, view, a)
     gov:chargeMotion(ms)
     noteUnit('reloadCollision', ms)
   end
+  step('collision')
 end
 
 -- A colliding mesh (sidewalks, bridge decks) never turns solid around the player's car (2026-10-13: the
@@ -2115,6 +2153,18 @@ local function releaseOrphans(player)
   if not left then orphanSince = nil end
 end
 M._releaseOrphans = releaseOrphans
+
+-- The sign tiles shown (diagnostics): how many, and the farthest one's centre from (x, y) in m.
+function M.signTiles(x, y)
+  local n, far = 0, 0
+  for _, t in pairs(tiles) do
+    if t.signOnly and not t.ghost and t.cx then
+      n = n + 1
+      far = math.max(far, math.sqrt((t.cx - x) ^ 2 + (t.cy - y) ^ 2))
+    end
+  end
+  return n, far
+end
 
 function M.status()
   local nt, no, nw, nr, nd, nb, ngForest, ngRows = 0, 0, 0, 0, 0, 0, 0, 0

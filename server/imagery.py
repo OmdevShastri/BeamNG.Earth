@@ -1331,40 +1331,48 @@ class Imagery:
         the chain (match_colours): NAIP's detail, USGS's colours, so the block's photo meets the far tiles
         around it (USGS, colour-matched and de-shadowed) without a seam (in-game 2026-10-13, Annapolis: the
         NAIP block was a darker, greener square, its water much darker)."""
-        rgb, used = self._render(frame, x0, y0, size, px, pending)
+        return self.render_where(EnuSquare(frame, x0, y0, size), px, pending)
+
+    def render_merc(self, z, x, y, px, pending=None):
+        """render() of Web-Mercator tile (z, x, y) with a gutter(px) border: px x px, the tile itself covering texels
+        g .. px - g on both axes (gutter_uv of its Mercator position), row 0 north (the far field's global tiles,
+        farfield.GTile: the same texture for every anchor)."""
+        return self.render_where(MercSquare(z, x, y, px), px, pending)
+
+    def render_where(self, where, px, pending=None):
+        """render() of a square (EnuSquare, MercSquare)."""
+        rgb, used = self._render(where, px, pending)
         if any(s.lazy and s.name in used for s in self.chain) and not all(s.lazy for s in self.chain):
             # the reference only gives the colour above MATCH_SIGMA_M: rendered and matched at MATCH_DOWN times
             # coarser texels (64x fewer texels to render, blur and stream through memory than at full size)
             small = max(MATCH_MIN_PX, px // MATCH_DOWN)
             try:
-                ref, _ = self._render(frame, x0, y0, size, small, pending, skip_lazy=True)
+                ref, _ = self._render(where, small, pending, skip_lazy=True)
             except ImageryError:            # the reference is unreachable: NAIP as served
                 ref = None
             if ref is not None:
-                rgb = match_colours(rgb, ref, MATCH_SIGMA_M / (size / small))
+                rgb = match_colours(rgb, ref, MATCH_SIGMA_M / (where.size / small))
                 if self.leaf_on and any(s.leaf_off and s.name in used for s in self.chain):
                     rgb = season.leaf_on(rgb, ref)
                     used["leafon"] = sum(used.get(s.name, 0) for s in self.chain if s.leaf_off)
-        return self._seasoned(frame, x0, y0, size, rgb), used
+        return self._seasoned(where, rgb), used
 
     SEASON_GRID = 17            # world positions for the season noise: on this grid, bilinear in between
 
-    def _seasoned(self, frame, x0, y0, size, rgb):
+    def _seasoned(self, where, rgb):
         """rgb graded toward the season (season.grade; season_mode "off": unchanged)."""
         if self.season_mode in (None, "off", "summer"):
             return rgb
-        n = self.SEASON_GRID
-        k = np.linspace(0.0, size, n)
-        E, N = np.meshgrid(x0 + k, y0 + size - k)               # row 0 = north
-        lat, lon, _ = frame.enu_to_geodetic(E, N, 0.0)
+        lat, lon = where.grid(self.SEASON_GRID - 1)             # row 0 = north
         amounts = season.amounts_for(self.season_mode, float(np.mean(lat)))
         if not any(v > 0 for v in amounts.values()):
             return rgb
         xm, ym = season.world_metres(lat, lon)
         return season.grade(rgb, xm, ym, amounts)       # (the grid, upscaled to the texels in the kernel)
 
-    def _render(self, frame, x0, y0, size, px, pending=None, skip_lazy=False):
-        """Texture of the ENU square [x0, x0+size] x [y0, y0+size] (anchor `frame`), px x px,
+    def _render(self, where, px, pending=None, skip_lazy=False):
+        """Texture of a square (where: EnuSquare: [x0, x0+size] x [y0, y0+size] of an anchor's frame; MercSquare),
+        px x px,
         row 0 = north edge, column 0 = west edge (texel centres at (i + 0.5) * size / px).
         Returns (uint8 [px, px, 3], tone-mapped, {source: texels}).
 
@@ -1382,11 +1390,9 @@ class Imagery:
         changed (their colours then come partly from its S2 references: the data credits name them)."""
         cells = min(MESH_CELLS, px)
         cw = px // cells
-        k = np.arange(cells + 1) * (size / cells)
-        E, N = np.meshgrid(x0 + k, y0 + size - k)                 # [row (north first), col]
-        lat_raw, lon, _ = frame.enu_to_geodetic(E, N, 0.0)
+        lat_raw, lon = where.grid(cells)                         # [row (north first), col]
         lat = np.clip(lat_raw, -89.9, 89.9)
-        zw = zoom_for(float(lat[cells // 2, cells // 2]), size / px)
+        zw = zoom_for(float(lat[cells // 2, cells // 2]), where.size / px)
         out = np.zeros((px, px, 3), np.uint8)
         filled = np.zeros((px, px), np.uint8)
         used, error, relit, full = {}, None, 0, False
@@ -1463,8 +1469,7 @@ class Imagery:
             out[hole] = self.lut[np.array(FALLBACK_RGB)]
             if np.abs(lat_raw).max() > MAX_LAT:      # the polar caps: snow
                 i, j = np.nonzero(hole)
-                t = size / px
-                la, _, _ = frame.enu_to_geodetic(x0 + (j + 0.5) * t, y0 + size - (i + 0.5) * t, 0.0)
+                la = where.texel_lat(i, j, px)
                 cap = np.abs(la) > MAX_LAT
                 out[i[cap], j[cap]] = self.lut[np.array(POLAR_RGB)]
                 if cap.any():
@@ -1482,6 +1487,53 @@ class Imagery:
         if self.colormatch is not None:
             self.colormatch.close()
         self.pool.shutdown(wait=False, cancel_futures=True)
+
+
+class EnuSquare:
+    """The square [x0, x0 + size] x [y0, y0 + size] of an anchor's frame (render's area)."""
+
+    def __init__(self, frame, x0, y0, size):
+        self.frame, self.x0, self.y0, self.size = frame, x0, y0, size
+
+    def grid(self, n):
+        """(lat, lon) of its (n + 1)^2 grid of corners, row 0 north, column 0 west."""
+        k = np.arange(n + 1) * (self.size / n)
+        E, N = np.meshgrid(self.x0 + k, self.y0 + self.size - k)
+        lat, lon, _ = self.frame.enu_to_geodetic(E, N, 0.0)
+        return lat, lon
+
+    def texel_lat(self, i, j, px):
+        t = self.size / px
+        la, _, _ = self.frame.enu_to_geodetic(self.x0 + (j + 0.5) * t, self.y0 + self.size - (i + 0.5) * t, 0.0)
+        return la
+
+
+class MercSquare:
+    """Web-Mercator tile (z, x, y) and a gutter(px) border round it (render_merc's area): its size the tile's edge
+    (m, at its centre's latitude) over the texels the tile covers, times px."""
+
+    def __init__(self, z, x, y, px):
+        g = gutter(px)
+        self.z, self.x, self.y = int(z), int(x), int(y)
+        self.f0 = -g / (px - 2 * g)                     # the square in tile fractions: [f0, f1]
+        self.f1 = 1.0 - self.f0
+        lat_c = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * (y + 0.5) / 2 ** z))))
+        self.size = EARTH_CIRC * math.cos(math.radians(lat_c)) / 2 ** z * (self.f1 - self.f0)
+
+    def _ll(self, fx, fy):
+        w = float(2 ** self.z)
+        lon = (self.x + fx) / w * 360.0 - 180.0
+        lat = np.degrees(np.arctan(np.sinh(np.pi * (1.0 - 2.0 * (self.y + fy) / w))))
+        return lat, lon
+
+    def grid(self, n):
+        f = self.f0 + np.arange(n + 1) * ((self.f1 - self.f0) / n)
+        FX, FY = np.meshgrid(f, f)                       # row 0 north: y fraction grows southwards
+        return self._ll(FX, FY)
+
+    def texel_lat(self, i, j, px):
+        t = (self.f1 - self.f0) / px
+        return self._ll(self.f0 + (j + 0.5) * t, self.f0 + (i + 0.5) * t)[0]
 
 
 # --- texture gutter ----------------------------------------------------------------------

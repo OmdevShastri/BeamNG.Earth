@@ -591,7 +591,7 @@ def barrier_solid(edge, inward, z, h, v=None, section=JERSEY):
 
 
 def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=None, parapet_h=PARAPET_H,
-         low_parapet_decks=()):
+         low_parapet_decks=(), pads=()):
     """The bridge decks of a tile as one colliding mesh: per "deck" chunk a slab of opaque concrete
     (DECK_SIDE) whose top is at the chunk's fixed heights (the road surface, drawn DECK_SKIN above it
     by build()), with sides and underside DECK_DEPTH below; the piers, and the truss beams (p, q, width, height:
@@ -601,11 +601,11 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
     dch = [c for c in chunks if c.get("deck")]
     cr_all = [(r, c) for r, c in ribbon_pairs(list(context)) if r[5] is not None]
     rb = trim_overlaps([(r, c) for r, c in ribbon_pairs(dch) if r[5] is not None], cr_all)
-    if not rb and not piers and not beams:
+    if not rb and not piers and not beams and not pads:
         return None
     low_parapet_decks = set(low_parapet_decks or ())
     if parapets is None:
-        parapets = parapet_runs(chunks, context, _rb=rb, ground=ground)
+        parapets = parapet_runs(chunks, context, _rb=rb, ground=ground, pads=pads)
     parapets_by_deck = {}
     for parapet in parapets:
         parapets_by_deck.setdefault(parapet["deck"], []).append(parapet)
@@ -694,6 +694,22 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
     for p in _piers_clear(piers, rb):
         _pier(p, origin, P, T, UV, M, side)
         nv = sum(len(a) for a in P)
+    for pad in pads:                # (junction pads on bridges: roads.deck_pads; their rim's railings)
+        ring, centre = pad[0], pad[1]
+        _pad(ring, centre, origin, P, T, UV, M, top, side)
+        nv = sum(len(a) for a in P)
+        for pts, out in (pad[2] if len(pad) > 2 else ()):
+            pts = np.asarray(pts, np.float64)
+            out = np.asarray(out, np.float64)
+            edge = pts[:, :2] + out * (JERSEY_HALF_W + 0.02)
+            ends = [tuple(edge[0]), tuple(edge[-1])]
+            h = parapet_heights(edge, ends)
+            bp, bt_, buv = barrier_solid(edge, -out, pts[:, 2] - PAD_DROP, h)
+            P.append(bp - origin)
+            UV.append(buv)
+            T.append(bt_ + nv)
+            M.append(np.full(len(bt_), side))
+            nv += len(bp)
     if len(beams):
         for pt in sorted({b[4] if len(b) > 4 else "grey" for b in beams}):
             mats.append(steel(pt))
@@ -747,6 +763,39 @@ def _beams(beams, origin, P, T, UV, M, mat):
     Tn[flip] = Tn[flip][:, ::-1]
     T.append(Tn + nv0)
     M.append(np.full(len(Tn), mat))
+
+
+PAD_DROP = 0.06        # m a junction pad's top lies under the roads' surfaces at its edge points (they draw over it)
+PAD_SKIRT = 0.5        # m of slab edge under its rim
+
+
+def _pad(ring, centre, origin, P, T, UV, M, top, side):
+    """A junction pad (roads.deck_pads: ring (k, 3) counter-clockwise, centre (3,)): its top a fan from the centre in
+    the decks' top material, its rim a skirt PAD_SKIRT deep, appended to P, T, UV, M (part of the colliding deck
+    mesh)."""
+    ring = np.asarray(ring, np.float64)
+    if len(ring) < 3:
+        return
+    c = np.asarray(centre, np.float64)
+    o = np.asarray(origin, np.float64)
+    nv = sum(len(a) for a in P)
+    k = len(ring)
+    top_v = np.vstack([c - [0, 0, PAD_DROP], ring - [0, 0, PAD_DROP]]) - o
+    P.append(top_v)
+    UV.append(np.c_[top_v[:, 0] / DECK_TOP_TILE_M, top_v[:, 1] / DECK_TOP_TILE_M])
+    i = np.arange(k)
+    T.append(np.c_[np.zeros(k, np.int64), 1 + i, 1 + (i + 1) % k] + nv)       # (counter-clockwise from above: up)
+    M.append(np.full(k, top))
+    nv += k + 1
+    a = ring - [0, 0, PAD_DROP]
+    b = a - [0, 0, PAD_SKIRT]
+    sk = np.vstack([a, b]) - o
+    P.append(sk)
+    UV.append(np.c_[np.r_[np.zeros(k), np.ones(k)] * 0.1, np.r_[i, i] * 0.25])
+    j = (i + 1) % k
+    # (outward: the ring runs counter-clockwise, so (a_i, b_j, a_j) and (a_i, b_i, b_j) face out)
+    T.append(np.concatenate([np.c_[i, k + j, j], np.c_[i, k + i, k + j]]) + nv)
+    M.append(np.full(2 * k, side))
 
 
 def _piers_clear(piers, rb):
@@ -901,7 +950,7 @@ def _parapet_cover(rb, context=()):
 
 
 
-def parapet_runs(chunks, context=(), _rb=None, ground=()):
+def parapet_runs(chunks, context=(), _rb=None, ground=(), pads=()):
     """Actual generated bridge parapets as XY centre lines plus the mesh geometry.
 
     Uses the same coverage masks, edge offsets, tunnel exclusion, and minimum-run rule as deck().
@@ -931,6 +980,9 @@ def parapet_runs(chunks, context=(), _rb=None, ground=()):
         wide = 0.0 if c.get("tunnel") else PARAPET_W
         gl, gr = medians[n]
         covered[n] = (covered[n][0] | (gl > 0), covered[n][1] | (gr > 0))
+        if len(pads):               # (none inside a junction pad: roads.deck_pads)
+            import roads as _roads
+            covered[n] = (covered[n][0] | _roads.pad_inside(pads, left), covered[n][1] | _roads.pad_inside(pads, right))
         el = left + u * np.maximum(wide, gl / 2 + 0.05)[:, None]
         er = right - u * np.maximum(wide, gr / 2 + 0.05)[:, None]
         k = len(z)

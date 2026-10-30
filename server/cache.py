@@ -114,6 +114,15 @@ class NoCache:
 NONE = NoCache()
 
 
+def _inside(path, root):
+    """Is path's real location (links resolved) inside root's?"""
+    try:
+        r = os.path.realpath(root)
+        return os.path.commonpath([os.path.realpath(path), r]) == r
+    except ValueError:              # (another drive on Windows)
+        return False
+
+
 class Cache(NoCache):
     """Bookkeeping, cap and eviction for one cache root. used() / wrote() / read() are thread-safe and
     cheap (any producer thread); evict(), clear() and save() take a while (the background thread, or
@@ -147,6 +156,14 @@ class Cache(NoCache):
         self.pinned = None
         self.pinned_bytes = None
         self.managed = self._check_version()
+        # a cache whose tracked folders are links into another one is never ours to trim: a benchmark's scratch
+        # cache of links into the real one (its index left out, so the default cap) evicted ~7 GB of the real
+        # cache's files through them, 2026-10-29. Read-only use is fine; eviction, clear and expiry stay off
+        linked = [top for top in MANAGED + KEPT if os.path.islink(os.path.join(self.root, top))]
+        if linked and self.managed:
+            log.warning("cache: %s under %s are links to elsewhere: this cache is left alone (no eviction or clear)",
+                        ", ".join(linked), self.root)
+            self.managed = False
         saved_cap = self._load_index()
         self._cap = cap_bytes(cap_gb if cap_gb is not None else
                               saved_cap / GB if saved_cap is not None else DEFAULT_CAP_GB)
@@ -483,8 +500,11 @@ class Cache(NoCache):
             if e is None or e[1] >= floor or not (self._evictable(key, e[0]) or
                                                   empty_too and e[0] == 0 and key.split("/", 1)[0] in MANAGED):
                 return None
+            path = self._path(key)
+            if not _inside(path, self.root):       # (never a file whose real place is outside this cache)
+                return None
             try:
-                os.remove(self._path(key))
+                os.remove(path)
             except FileNotFoundError:
                 pass
             except OSError as err:

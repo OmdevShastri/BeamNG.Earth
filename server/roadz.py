@@ -14,7 +14,10 @@ Sources, each per z14 map-data cell, kept on disk under <cache>/roadz/v<VERSION>
   drivable surface picked by a Viterbi pass; any non-noise class, as class 17 is not to be trusted: Baltimore 2014
   put it on the ground), the dataset's heights brought onto our DEM's (the median of its ground points' difference;
   feet found by the scale that fits). The EPT nodes of one octree depth (the first with LIDAR_DENSITY points a m2)
-  along the bridges only: ~0.3 MB a node, a few per bridge.
+  along the bridges only: ~0.3 MB a node, a few per bridge. Then the drawn roads' ground pieces going on from a deck
+  end that the lidar shows elevated (roads.lidar_gap_candidates: an untagged viaduct stretch), read where the
+  deck's measured end stands over the DTM only (the nodes the decks' read had not): their elevated start is a deck
+  in roads.level_ranges (gap_answers, one decision per cell and server run; BNE_LIDAR_GAPS=off: none).
 Matching (earthfast.roadz_match): each station of a map road takes the nearest source segment of its level (bridge,
 tunnel, ground) within reach whose direction agrees and whose name / number does not contradict the map's; the
 heights then lose their spikes and impossible grades (earthfast.profile_clean). Vector heights are taken relative to
@@ -42,7 +45,7 @@ import mapcells
 
 log = logging.getLogger("earthd.roadz")
 
-VERSION = 1
+VERSION = 2                 # (2: the lidar cells carry the ground stretches found elevated: <y>.npz.gaps.json)
 NATIVE = 102                # earthfast.VERSION of the kernels below
 ON = os.environ.get("BNE_ROADZ", "on") != "off"
 LIDAR_ON = os.environ.get("BNE_LIDAR_DECKS", "on") != "off"
@@ -94,6 +97,19 @@ DATUM_NEAR_M = 300.0        # m round a part's ends its source's ground roads gi
 DATUM_NEAR_MIN = 5
 DEM_ZOOM = 15
 MEM_CELLS = 96
+# The elevated ground stretches (roads.lidar_gap_candidates / _lidar_gaps): measured in the decks' own lidar read, a
+# stretch is elevated from the deck's end while its surface stays LIDAR_GAP_RISE_M or more over our DTM (the first
+# station within LIDAR_GAP_END_TOL_M of the deck's measured end), LIDAR_GAP_MISS stations without passed over; kept when
+# LIDAR_GAP_MIN_M or longer. gap_answers waits LIDAR_GAPS_WAIT_S at most for a cell's lidar (the rule meanwhile, for the
+# whole session: the decision is kept in a session folder every process of the server reads, BNGE_ROADZ_SESSION).
+LIDAR_GAP_RISE_M = 3.0
+LIDAR_GAP_END_TOL_M = 1.5
+LIDAR_GAP_MISS = 1
+LIDAR_GAP_MIN_M = 8.0
+LIDAR_GAPS_WAIT_S = float(os.environ.get("BNE_LIDAR_GAPS_WAIT", "8"))
+GAP_NATIVE = 107            # earthfast.VERSION of lidar_gap_stretch
+SESSION_ENV = "BNGE_ROADZ_SESSION"      # (not BNE_: those are part of the revisit cache's code key)
+SESSION_KEEP_S = 86400.0
 
 _TOKEN = re.compile(r"[a-z0-9]+")
 _REF = re.compile(r"^([a-z]{0,3})(\d{1,4})([a-z]?)$")
@@ -430,6 +446,9 @@ class RoadZ:
 
     # ---- cells ----
     def _path(self, src, key):
+        import roads
+        if src == "lidar" and not roads.LIDAR_GAPS_ON:
+            src = "lidar-nogaps"            # (built without the ground stretches: not the cells with them)
         return os.path.join(self.dir, src, str(key.z), str(key.x), f"{key.y}.npz") if self.dir else None
 
     def lines(self, src, key):
@@ -452,8 +471,12 @@ class RoadZ:
             if p and os.path.exists(p):
                 try:
                     got = Lines.load(p)
+                    if src == "lidar":      # (its elevated ground stretches: written before the lines)
+                        with open(p + ".gaps.json", encoding="utf-8") as fh:
+                            got.gaps = [(str(f), tuple(a), tuple(b)) for f, a, b in json.load(fh)]
                 except Exception as e:
                     log.debug("roadz read %s: %s", p, e)
+                    got = None
             if got is None:
                 t0 = time.monotonic()
                 try:
@@ -470,6 +493,13 @@ class RoadZ:
                     self.stats["seconds"] += time.monotonic() - t0
                 if p:
                     try:
+                        if src == "lidar":
+                            import staging
+                            os.makedirs(os.path.dirname(p), exist_ok=True)
+                            tmp = staging.tmp_for(p + ".gaps.json")
+                            with open(tmp, "w", encoding="utf-8") as fh:
+                                json.dump([[f, list(a), list(b)] for f, a, b in getattr(got, "gaps", [])], fh)
+                            staging.replace_cached(tmp, p + ".gaps.json")
                         got.save(p)
                     except Exception as e:
                         log.debug("roadz write %s: %s", p, e)
@@ -571,44 +601,63 @@ class RoadZ:
         pad_lat = CLIP_PAD_M / 111320.0
         pad_lon = pad_lat / max(0.05, math.cos(math.radians((lat0 + lat1) / 2)))
         out = []
-        bs = roads.bridge_specs(feats)
-        for i in range(len(feats)):
-            if bs[i] is None:
+        # (the rule's ranges: roads.level_ranges asks this provider for the lidar's stretches, gap_answers)
+        for i, rr in sorted(roads.rule_level_ranges_near(feats).items()):
+            if not any(k == "bridge" for _, _, k in rr):
                 continue
-            for ring in roads.bridge_parts(feats, i):
+            w = roads._structure_width(feats, i)
+            if w is None:
+                continue
+            for ring in roads._parts_by_level_new(feats, i, "bridge", rr):
                 ring = np.asarray(ring, np.float64)[:, :2]
                 inside = ((ring[:, 0] >= lon0 - pad_lon) & (ring[:, 0] <= lon1 + pad_lon)
                           & (ring[:, 1] >= lat0 - pad_lat) & (ring[:, 1] <= lat1 + pad_lat))
                 if len(ring) >= 2 and inside.any():
-                    out.append((ring, max(2.5, bs[i].width / 2)))
+                    out.append((ring, max(2.5, w / 2)))
         return out
+
+    def _gap_candidates(self, key):
+        """roads.lidar_gap_candidates of the cell whose deck end (the line's first point) lies in its box: [(fid, lonlat
+        (k, 2), half width)] ([] off)."""
+        import roads
+        if not roads.LIDAR_GAPS_ON or not self.md:
+            return []
+        feats = self.md.cell(key, layers=("roads",), kind="demand").layers.get("roads")
+        if feats is None or not len(feats):
+            return []
+        lon0, lat0, lon1, lat1 = key.bounds()
+        return [c for c in roads.lidar_gap_candidates(feats)
+                if lon0 <= c[1][0, 0] < lon1 and lat0 <= c[1][0, 1] < lat1]
 
     def _lidar(self, key):
         import geodesy
         parts = self._bridges(key)
-        if not parts:
+        cands = self._gap_candidates(key)
+        if not parts and not cands:
             return Lines.build([], corrected=True)
         lat_c, lon_c = key.center()
         names = lidar_datasets(lat_c, lon_c)
         if not names:
-            mid = parts[0][0][len(parts[0][0]) // 2]
+            first = parts[0][0] if parts else cands[0][1]
+            mid = first[len(first) // 2]
             names = lidar_datasets(float(mid[1]), float(mid[0]))
         if not names:
             return Lines.build([], corrected=True)
         frame = geodesy.EnuFrame(lat_c, lon_c)
+        nb = len(parts)
+        parts = parts + [(ring, half) for _fid, ring, half in cands]     # (the candidates measured in the same read)
         local = []
         for ring, half in parts:
             e, n, _ = frame.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.0)
             local.append((np.stack([np.asarray(e), np.asarray(n)], 1), half))
         for name in names[:LIDAR_DATASETS]:
-            got = self._lidar_from(name, key, frame, parts, local)
+            got = self._lidar_from(name, key, frame, parts, local, nb, [c[0] for c in cands])
             if got is not None:
                 return got
         return Lines.build([], corrected=True)
 
-    def _lidar_from(self, name, key, frame, parts, local):
-        """The cell's decks from dataset name, or None when it has no usable points there."""
-        ept = self._ept_of(name)
+    def _boxes(self, frame, parts, local):
+        """EPT boxes (Mercator) along parts: one per BOX_STEP_M of each line, padded by its half width."""
         boxes = []
         for (ring, half), (xy, _h) in zip(parts, local):
             # (a box per BOX_STEP_M of the line: a curving ramp's own box took in every node round its curve)
@@ -621,15 +670,11 @@ class RoadZ:
                 xs, ys = x[j:j + 2], y[j:j + 2]
                 boxes.append((float(xs.min()) - pad, float(ys.min()) - pad, float(xs.max()) + pad,
                               float(ys.max()) + pad))
-        b0 = boxes[len(boxes) // 2]            # (at a bridge: the cell's centre may lie outside the dataset)
-        depth = ept.depth_at((b0[0] + b0[2]) / 2, (b0[1] + b0[3]) / 2)
-        nodes = ept.nodes(boxes, depth)
-        if not nodes:
-            return None
-        if len(nodes) > LIDAR_NODES_MAX:
-            log.debug("roadz lidar %s %s: %d nodes, over %d", name, key, len(nodes), LIDAR_NODES_MAX)
-            return None
-        fast.require(NATIVE, "roadz lidar decks")
+        return boxes
+
+    def _read(self, name, nodes, boxes):
+        """(xyz (n, 3) Mercator / the dataset's heights, class (n,)) of the EPT nodes' points in boxes, LIDAR_FETCH_THREADS
+        reads at once, in node order."""
         bb = [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
         # the boxes as a grid of MASK_M cells (the points kept: those in a box's cells)
         nx = int(math.ceil((bb[2] - bb[0]) / MASK_M)) + 1
@@ -651,10 +696,35 @@ class RoadZ:
             got = list(pool.map(read, nodes))           # (in node order: the same points whichever came first)
         xyz = [p for p, _c in got if len(p)]
         cls = [c for p, c in got if len(p)]
-        if not xyz or not sum(len(p) for p in xyz):
+        if not xyz:
+            return np.zeros((0, 3)), np.zeros(0, np.uint8)
+        return np.concatenate(xyz), np.concatenate(cls)
+
+    def _lidar_from(self, name, key, frame, parts, local, nb=None, fids=()):
+        """The cell's decks from dataset name, or None when it has no usable points there. parts[nb:] are ground
+        stretches from a deck's end (roads.lidar_gap_candidates, of the features fids): read (the EPT nodes the decks'
+        read had not) only where a deck's measured end stands LIDAR_GAP_RISE_M or more over the DTM; the elevated ones
+        go in as decks (their measured lines) and in the result's gaps [(fid, lon / lat from, lon / lat to)]."""
+        nb = len(parts) if nb is None else nb
+        if nb == 0:
+            got = Lines.build([], corrected=True)
+            got.gaps = []
+            return got
+        ept = self._ept_of(name)
+        boxes = self._boxes(frame, parts[:nb], local[:nb])
+        b0 = boxes[len(boxes) // 2]            # (at a bridge: the cell's centre may lie outside the dataset)
+        depth = ept.depth_at((b0[0] + b0[2]) / 2, (b0[1] + b0[3]) / 2)
+        nodes = ept.nodes(boxes, depth)
+        if not nodes:
             return None
-        xyz = np.concatenate(xyz)
-        cls = np.concatenate(cls)
+        if len(nodes) > LIDAR_NODES_MAX:
+            log.debug("roadz lidar %s %s: %d nodes, over %d", name, key, len(nodes), LIDAR_NODES_MAX)
+            return None
+        fast.require(NATIVE, "roadz lidar decks")
+        # (the points of these nodes along every candidate kept too: a stretch's own nodes are partly the decks')
+        xyz, cls = self._read(name, nodes, boxes + self._boxes(frame, parts[nb:], local[nb:]))
+        if not len(xyz):
+            return None
         la, lo = merc_ll(xyz[:, 0], xyz[:, 1])
         # the dataset's datum onto ours: its ground points (class 2) against our DEM
         gi = np.flatnonzero(cls == 2)
@@ -665,22 +735,221 @@ class RoadZ:
             log.debug("roadz lidar %s %s: no datum fit (%d ground points)", name, key, len(gi))
             return None
         scale, off = fit
-        e, n, _ = frame.geodetic_to_enu(la, lo, 0.0)
-        pts = np.ascontiguousarray(np.stack([np.asarray(e), np.asarray(n), xyz[:, 2] * scale - off], 1))
+
+        def local_pts(xyz_, la_, lo_):
+            e, n, _ = frame.geodetic_to_enu(la_, lo_, 0.0)
+            return np.ascontiguousarray(np.stack([np.asarray(e), np.asarray(n), xyz_[:, 2] * scale - off], 1))
+        pts = local_pts(xyz, la, lo)
         cls = np.ascontiguousarray(cls, np.uint8)
-        rows = []
+        rows, ends = self._decks(frame, parts[:nb], local[:nb], pts, cls)
+        gaps, extra = [], 0
+        # the stretches from an elevated deck end only, their nodes the decks' read had not
+        todo = [n_ for n_ in range(nb, len(parts)) if self._elevated_end(frame, ends, local[n_][0][0])]
+        if todo:
+            fast.require(GAP_NATIVE, "roadz lidar gaps")
+            cb = self._boxes(frame, [parts[n_] for n_ in todo], [local[n_] for n_ in todo])
+            had = set(nodes)
+            more = [k for k in ept.nodes(cb, depth) if k not in had]
+            if len(more) + len(nodes) <= LIDAR_NODES_MAX:
+                extra = len(more)
+                if more:
+                    x2, c2 = self._read(name, more, cb)
+                    if len(x2):
+                        la2, lo2 = merc_ll(x2[:, 0], x2[:, 1])
+                        pts = np.ascontiguousarray(np.vstack([pts, local_pts(x2, la2, lo2)]))
+                        cls = np.ascontiguousarray(np.r_[cls, np.asarray(c2, np.uint8)])
+                r2, gaps = self._stretches(frame, [parts[n_] for n_ in todo], [local[n_] for n_ in todo],
+                                           [fids[n_ - nb] for n_ in todo], pts, cls, ends)
+                rows += r2
+        log.debug("roadz lidar %s %s: depth %d, %d + %d nodes, %d points, %d decks, %d of %d stretches elevated, datum "
+                  "%.3f x - %.2f", name, key, depth, len(nodes), extra, len(pts), nb, len(gaps), len(parts) - nb, scale,
+                  off)
+        got = Lines.build(rows, corrected=True)
+        got.gaps = gaps
+        return got
+
+    @staticmethod
+    def _profile(frame, xy, half, pts, cls):
+        """deck_lidar along line xy: (s, z, the stations' x, y, lat, lon, arc of xy) or None without a surface."""
+        s, z, _cnt = fast._ef.deck_lidar(np.ascontiguousarray(xy), pts, cls, float(half + LIDAR_PAD_M),
+                                         LIDAR_STEP_M, LIDAR_MAX_GRADE, 3, 24.0, 4.0)
+        s, z = np.asarray(s, np.float64), np.asarray(z, np.float64)
+        if len(s) < 2 or not np.isfinite(z).any():
+            return None
+        arc = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
+        sx, sy = np.interp(s, arc, xy[:, 0]), np.interp(s, arc, xy[:, 1])
+        sla, slo, _ = frame.enu_to_geodetic(sx, sy, 0.0)
+        return s, z, sx, sy, np.asarray(sla, np.float64), np.asarray(slo, np.float64), arc
+
+    def _decks(self, frame, parts, local, pts, cls):
+        """(rows, ends): the decks' measured lines (Lines.build rows) and their measured ends [(x, y, z)]."""
+        rows, ends = [], []
         for (ring, half), (xy, _h) in zip(parts, local):
-            s, z, cnt = fast._ef.deck_lidar(np.ascontiguousarray(xy), pts, cls, float(half + LIDAR_PAD_M),
-                                            LIDAR_STEP_M, LIDAR_MAX_GRADE, 3, 24.0, 4.0)
-            if len(s) < 2 or not np.isfinite(z).any():
+            got = self._profile(frame, xy, half, pts, cls)
+            if got is None:
                 continue
-            arc = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
-            sx, sy = np.interp(s, arc, xy[:, 0]), np.interp(s, arc, xy[:, 1])
-            sla, slo, _ = frame.enu_to_geodetic(sx, sy, 0.0)
-            rows.append((np.stack([np.asarray(slo), np.asarray(sla)], 1), z, 1, "", ""))
-        log.debug("roadz lidar %s %s: depth %d, %d nodes, %d points, %d decks, datum %.3f x - %.2f", name, key, depth,
-                  len(nodes), len(pts), len(rows), scale, off)
-        return Lines.build(rows, corrected=True)
+            s, z, sx, sy, sla, slo, _arc = got
+            rows.append((np.stack([slo, sla], 1), z, 1, "", ""))
+            ok = np.flatnonzero(np.isfinite(z))
+            for at, far in ((ok[0], s[ok[0]]), (ok[-1], s[-1] - s[ok[-1]])):
+                if far <= LIDAR_STEP_M:             # (measured right at its end: where a stretch must go on from)
+                    ends.append((float(sx[at]), float(sy[at]), float(z[at])))
+        return rows, ends
+
+    def _end_z(self, ends, p):
+        """The measured deck end height within 2 LIDAR_STEP_M of p (x, y), NaN: none."""
+        if not ends:
+            return np.nan
+        de = np.asarray(ends, np.float64)
+        d = np.hypot(de[:, 0] - p[0], de[:, 1] - p[1])
+        k = int(np.argmin(d))
+        return float(de[k, 2]) if d[k] <= 2.0 * LIDAR_STEP_M else np.nan
+
+    def _elevated_end(self, frame, ends, p):
+        """Does a measured deck end at p (x, y) stand LIDAR_GAP_RISE_M or more over our DTM?"""
+        z = self._end_z(ends, p)
+        if not np.isfinite(z):
+            return False
+        la, lo, _ = frame.enu_to_geodetic(np.array([p[0]]), np.array([p[1]]), 0.0)
+        g = float(self._dem_raw(np.asarray(la, np.float64), np.asarray(lo, np.float64))[0])
+        return np.isfinite(g) and z - g >= LIDAR_GAP_RISE_M
+
+    def _stretches(self, frame, parts, local, fids, pts, cls, ends):
+        """(rows, gaps) of the ground stretches parts (from a deck's end: lidar_gap_stretch) of the features fids."""
+        rows, gaps = [], []
+        for fid, (ring, half), (xy, _h) in zip(fids, parts, local):
+            z_end = self._end_z(ends, xy[0])
+            got = self._profile(frame, xy, half, pts, cls) if np.isfinite(z_end) else None
+            if got is None:
+                continue
+            s, z, sx, sy, sla, slo, arc = got
+            dem = self._dem_raw(sla, slo)
+            m = float(fast._ef.lidar_gap_stretch(np.ascontiguousarray(s), np.ascontiguousarray(z),
+                                                 np.ascontiguousarray(dem, np.float64), z_end, LIDAR_GAP_RISE_M,
+                                                 LIDAR_GAP_END_TOL_M, LIDAR_GAP_MISS))
+            if m < LIDAR_GAP_MIN_M:
+                continue
+            keep = s <= m + 1e-6
+            rows.append((np.stack([slo, sla], 1)[keep], z[keep], 1, "", ""))
+            ex, ey = np.interp(m, arc, xy[:, 0]), np.interp(m, arc, xy[:, 1])
+            ela, elo, _ = frame.enu_to_geodetic(np.array([ex]), np.array([ey]), 0.0)
+            gaps.append((str(fid), (float(ring[0, 0]), float(ring[0, 1])), (float(elo[0]), float(ela[0]))))
+        return rows, gaps
+
+    def _measure(self, frame, parts, local, nb, fids, pts, cls):
+        """(rows, gaps): _decks of parts[:nb], then _stretches of the rest (of the features fids) that go on from an
+        elevated measured deck end, all from the points pts (n, 3) in frame (heights on our DEM's datum), cls (n,)."""
+        rows, ends = self._decks(frame, parts[:nb], local[:nb], pts, cls)
+        todo = [n_ for n_ in range(nb, len(parts)) if self._elevated_end(frame, ends, local[n_][0][0])]
+        r2, gaps = self._stretches(frame, [parts[n_] for n_ in todo], [local[n_] for n_ in todo],
+                                   [fids[n_ - nb] for n_ in todo], pts, cls, ends)
+        return rows + r2, gaps
+
+    # ---- the elevated ground stretches, one answer per cell and session ----
+    def _session_dir(self):
+        """The folder this server run's decisions are kept in (its processes share BNGE_ROADZ_SESSION; a process alone:
+        its own), older runs' cleared out once. None without a cache."""
+        if not self.dir:
+            return None
+        got = getattr(self, "_sdir", None)
+        if got is not None:
+            return got
+        sid = re.sub(r"[^A-Za-z0-9_.-]", "_", os.environ.get(SESSION_ENV) or f"p{os.getpid()}.{int(time.time())}")
+        root = os.path.join(self.dir, "gapsession")
+        got = os.path.join(root, sid)
+        os.makedirs(got, exist_ok=True)
+        try:
+            now = time.time()
+            for name in os.listdir(root):
+                q = os.path.join(root, name)
+                if name != sid and now - os.path.getmtime(q) > SESSION_KEEP_S:
+                    import shutil
+                    shutil.rmtree(q, ignore_errors=True)
+        except OSError:
+            pass
+        self._sdir = got
+        return got
+
+    def _decide(self, key, gaps):
+        """This session's decision for cell key: gaps (a list, or None: the rule) unless a process decided first, whose
+        decision is taken (a file made once: os.link fails when it is there)."""
+        d = self._session_dir()
+        if d is None:
+            return gaps
+        p = os.path.join(d, f"{key.z}_{key.x}_{key.y}.json")
+        if not os.path.exists(p):
+            tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"gaps": None if gaps is None else [[f, list(a), list(b)] for f, a, b in gaps]}, fh)
+            try:
+                os.link(tmp, p)
+            except OSError:
+                pass                        # (decided by another process meanwhile)
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        try:
+            with open(p, encoding="utf-8") as fh:
+                got = json.load(fh)["gaps"]
+            return None if got is None else [(str(f), tuple(a), tuple(b)) for f, a, b in got]
+        except (OSError, ValueError, KeyError, TypeError):
+            return gaps
+
+    def gap_answers(self, keys):
+        """{key: [(fid, lon / lat from, lon / lat to)] the cell's elevated ground stretches, or None: the rule} for the
+        cells keys (the cells holding the deck ends of a roads layer's candidates), the same in every process of this
+        server run: the cell's lidar (built if need be, LIDAR_GAPS_WAIT_S at most, in parallel) or this run's decision.
+        A cell left to the rule is a revisit fault (no cached ranges from it). [] outside the lidar's reach."""
+        out, todo = {}, []
+        for key in keys:
+            key = mapcells.CellKey(int(key[0]), int(key[1]), int(key[2]))
+            la, lo = key.center()
+            if not self.enabled or not self.lidar or self.fetcher is None or "lidar" not in sources_at(la, lo, True):
+                out[key] = []
+                continue
+            mk = ("gapans", str(key))
+            with self._lock:
+                got = self._off.get(mk, ...)
+            if got is not ...:
+                if got is None:             # (each build that takes the rule from it is not kept either)
+                    import revisit
+                    revisit.fault()
+                out[key] = got
+                continue
+            todo.append(key)
+        if todo:
+            done = {}
+
+            def build(key):
+                try:
+                    ln = self.lines("lidar", key)
+                    done[str(key)] = None if ln is None else list(getattr(ln, "gaps", []))
+                except Exception as e:
+                    log.debug("roadz lidar gaps %s: %s: %s", key, type(e).__name__, e)
+                    done[str(key)] = None
+            threads = []
+            for key in todo:
+                d = self._session_dir()
+                p = os.path.join(d, f"{key.z}_{key.x}_{key.y}.json") if d else None
+                if p and os.path.exists(p):
+                    continue                # (decided already: _decide reads it)
+                t = threading.Thread(target=build, args=(key,), name="roadz-gaps", daemon=True)
+                t.start()
+                threads.append(t)
+            end = time.monotonic() + LIDAR_GAPS_WAIT_S
+            for t in threads:
+                t.join(max(0.0, end - time.monotonic()))
+            for key in todo:
+                got = self._decide(key, done.get(str(key)))     # (not built in time: None, the rule)
+                if got is None:
+                    import revisit
+                    revisit.fault()
+                with self._lock:
+                    self._off[("gapans", str(key))] = got
+                out[key] = got
+        return out
 
     # ---- heights for a map road ----
     def _dem_raw(self, la, lo):

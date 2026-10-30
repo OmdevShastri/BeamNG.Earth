@@ -388,6 +388,11 @@ do
   trees.POOL_SPARE = 0
   trees.clear()
 end
+-- spares only while calm (the governor's loading budget: a teleport, the level's start, the car standing), none while
+-- driving (a ~9 ms Forest every 3 s of a town drive made the game's time run unevenly, 2026-10-29)
+T.check(trees.spareWanted(FRAME_MS) == 0, 'driving (the real frame budget): no spare Forests made')
+T.check(trees.spareWanted(trees.LOADING_FRAME_MS) == trees.POOL_SPARE_CALM, 'calm: a bigger pool made ready')
+T.check(trees.spareWanted(nil) == trees.POOL_SPARE, 'no governor: POOL_SPARE')
 
 -- the row cap (ROWS_PER_FRAME) leaves a tile's refresh (navgraph's signal heads: M.suppress) for a later frame; it
 -- dropped it, and the tile kept its static signal under the switchable one

@@ -856,3 +856,33 @@ class HeldReadTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LinkedCacheTest(unittest.TestCase):
+    """A scratch cache of links into a real one must never delete the real one's files (2026-10-29: ~7 GB evicted
+    through the links of a benchmark's scratch cache)."""
+
+    def test_a_cache_whose_folders_are_links_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as real, tempfile.TemporaryDirectory() as scratch:
+            d = os.path.join(real, "dem", "z")
+            os.makedirs(d)
+            f = os.path.join(d, "1.webp")
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 4096)
+            os.symlink(os.path.join(real, "dem"), os.path.join(scratch, "dem"))
+            c = cachemod.Cache(scratch, cap_gb=0.000001, start=False)
+            self.assertFalse(c.managed, "linked folders: left alone")
+            c.scan()
+            c.evict(0)
+            c.clear(wait=0.1)
+            self.assertTrue(os.path.exists(f), "the real file stays")
+
+    def test_remove_never_follows_a_link_out_of_the_cache(self):
+        with tempfile.TemporaryDirectory() as real, tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "dem", "z"))
+            target = os.path.join(real, "1.webp")
+            with open(target, "wb") as fh:
+                fh.write(b"x" * 10)
+            os.symlink(target, os.path.join(root, "dem", "z", "1.webp"))
+            self.assertFalse(cachemod._inside(os.path.join(root, "dem", "z", "1.webp"), root))
+            self.assertTrue(cachemod._inside(os.path.join(root, "dem", "z", "2.webp"), root))

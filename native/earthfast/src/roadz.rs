@@ -550,3 +550,58 @@ pub fn deck_blend<'py>(py: Python<'py>, s: PyReadonlyArray1<'py, f64>, z: PyRead
     }
     out.into_pyarray(py)
 }
+
+/// How far a ground road goes on elevated from a deck's end (roads.lidar_gap_candidates, roadz.RoadZ: an untagged
+/// viaduct stretch). Its stations at arc lengths s (ascending, from the deck's end), the surface the lidar picked
+/// there z (NaN: none) and the DTM under it dem: the stretch starts at the first station with a surface (one of the
+/// first two) when that is at least rise_m over the DTM and, where the deck's own measured end height z_end is known
+/// (else NaN), within end_tol_m of it; it goes on over stations at least rise_m over the DTM, max_miss stations
+/// without (no surface, or lower) passed over at most in a row. m along the line to its last such station, 0: none.
+pub fn gap_stretch(s: &[f64], z: &[f64], dem: &[f64], z_end: f64, rise_m: f64, end_tol_m: f64, max_miss: usize) -> f64 {
+    let n = s.len().min(z.len()).min(dem.len());
+    let up = |k: usize| z[k].is_finite() && dem[k].is_finite() && z[k] - dem[k] >= rise_m;
+    let Some(first) = (0..n.min(2)).find(|&k| z[k].is_finite()) else { return 0.0 };
+    if !up(first) || (z_end.is_finite() && (z[first] - z_end).abs() > end_tol_m) {
+        return 0.0;
+    }
+    let (mut last, mut miss) = (first, 0usize);
+    for k in first + 1..n {
+        if up(k) {
+            last = k;
+            miss = 0;
+        } else {
+            miss += 1;
+            if miss > max_miss {
+                break;
+            }
+        }
+    }
+    s[last]
+}
+
+/// gap_stretch for Python: (s, z, dem) (n,), z_end (NaN: unknown), rise_m, end_tol_m, max_miss. m.
+#[pyfunction]
+pub fn lidar_gap_stretch<'py>(s: PyReadonlyArray1<'py, f64>, z: PyReadonlyArray1<'py, f64>,
+                              dem: PyReadonlyArray1<'py, f64>, z_end: f64, rise_m: f64, end_tol_m: f64,
+                              max_miss: usize) -> f64 {
+    let (s, z, dem) = (s.as_array().to_vec(), z.as_array().to_vec(), dem.as_array().to_vec());
+    gap_stretch(&s, &z, &dem, z_end, rise_m, end_tol_m, max_miss)
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::gap_stretch;
+
+    #[test]
+    fn elevated_stretch_then_ground() {
+        let s: Vec<f64> = (0..10).map(|k| 4.0 * k as f64).collect();
+        let dem = vec![10.0; 10];
+        let z = vec![18.0, 17.8, 17.5, 17.2, f64::NAN, 16.8, 11.0, 10.2, 10.1, 10.0];
+        assert_eq!(gap_stretch(&s, &z, &dem, 18.1, 3.0, 1.5, 1), 20.0);
+        // (an at-grade end, or one off the deck's measured end, or no surface: none)
+        let low = vec![10.2, 10.4, 10.6, 10.8, 11.0, 11.2, 11.4, 11.6, 11.8, 12.0];
+        assert_eq!(gap_stretch(&s, &low, &dem, 10.0, 3.0, 1.5, 1), 0.0);
+        assert_eq!(gap_stretch(&s, &z, &dem, 25.0, 3.0, 1.5, 1), 0.0);
+        assert_eq!(gap_stretch(&s, &[f64::NAN; 10], &dem, f64::NAN, 3.0, 1.5, 1), 0.0);
+    }
+}

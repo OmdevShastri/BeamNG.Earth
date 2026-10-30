@@ -1289,8 +1289,9 @@ class _Planner:
         return obs
 
     def _observed_lift(self, bridge, xy, z_at):
-        """m the abutment at bridge end xy is raised when a source measured the deck (roadz.PROVIDER, level 1): the
-        measured deck end over the ground there, 0 or more; None when none did (the inference: bridge_lifts)."""
+        """(m the abutment at bridge end xy is raised, the measured deck end's height) when a source measured the deck
+        (roadz.PROVIDER, level 1): the measured deck end over the ground there, 0 or more; None when none did (the
+        inference: bridge_lifts)."""
         import roadz
         prov = roadz.PROVIDER
         if prov is None or not prov.enabled:
@@ -1310,7 +1311,7 @@ class _Planner:
         if not len(near):
             return None
         k = int(near[np.argmin(d[near])])
-        return max(0.0, float(z[k]) - float(z_at(np.asarray([xy], np.float64))[0]))
+        return max(0.0, float(z[k]) - float(z_at(np.asarray([xy], np.float64))[0])), float(z[k])
 
     def _coarse(self, key):
         """Is cell key's elevation only the coarse global model (dem.coarse_at its centre)? False without a DEM."""
@@ -1379,6 +1380,14 @@ class _Planner:
                 if _never_raised(specs[i]) and not got[3]:
                     continue
                 lift, others = got[0], got[1]
+                if len(got) > 4 and got[4] is not None:
+                    # (a measured deck end: up to its height from the plan's own there, not from the ground under the
+                    # point, which may lie down the cut the deck spans: Charles Street's approach over I-83 rose 2.2 m
+                    # over its plan to a deck end measured at the street's height, 2026-10-29)
+                    zp = float(np.asarray(p.z, np.float64)[-1 if at_end else 0])
+                    lift = min(float(got[4]) - zp, APPROACH_MAX_LIFT)
+                    if lift < APPROACH_MIN_LIFT:
+                        continue
                 a = approach_add(p.xy, at_end, lift, p.half, others)
                 if a is not None:
                     add = a if add is None else np.maximum(add, a)
@@ -1812,7 +1821,9 @@ class _Planner:
                 break
         seen = self._observed_lift(bridge, xy, z_at)
         if seen is not None:            # (a measured deck: its own end, not what the clearance rules would need)
-            return None if seen < APPROACH_MIN_LIFT else (min(seen, APPROACH_MAX_LIFT), others, approaches, False)
+            seen, target = seen
+            return None if seen < APPROACH_MIN_LIFT else (min(seen, APPROACH_MAX_LIFT), others, approaches, False,
+                                                          target)
         wl = self._water_lift(bridge, chain, xy, z_at) if bridge_chain_ends_free(bridge, bridges, xy) else 0.0
         if wl >= APPROACH_MIN_LIFT and (best is None or wl > best):
             return min(wl, WATER_MAX_LIFT), others, approaches, True
