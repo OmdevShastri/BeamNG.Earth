@@ -2,7 +2,7 @@
 
 **Target Remote:** `upstream/dev` / **Branch:** `collab-pr-671`  
 **Related Issues:** #627, #651  
-**Co-Authored & Built Upon:** Upstream PR #671 by @TecnaGamer & Claude Opus 5.5
+**Co-Authored & Built Upon:** Upstream PR #671 by @yahms & Claude Opus 5.5
 
 ---
 
@@ -121,3 +121,4 @@ All existing and new test suites pass:
 ## 📝 Commits Included
 - Upstream dev commits `375377c6` through `49d6d83c` (caching, baked packs, facts optimizations) merged cleanly.
 - `collab-pr-671`: ADMM QP solver, 0mm abutment blend, guardrail gap fix, seatile flood fix, and overpass parallel equalization.
+
