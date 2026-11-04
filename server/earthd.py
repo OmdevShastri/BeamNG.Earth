@@ -83,6 +83,7 @@ import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 import blockworker  # noqa: E402
+import budget  # noqa: E402
 import cache as cachemod  # noqa: E402
 import cdae  # noqa: E402
 import colormatch as colormatchmod  # noqa: E402
@@ -878,6 +879,8 @@ class Server:
                                            deshadow=self.deshadow, colormatch=self.colormatch, fetcher=self.net,
                                            leaf_on=leaf_on, season_mode=season_mode)
                         if imagery else None)
+        if self.imagery is not None:
+            budget.register_shed(self.imagery.clear_memory)
         self.imagery_failures = 0           # tiles that fell back to the palette (network trouble)
         self.imagery_worker = 0             # far textures the far-tile processes rendered (blockworker.far_tile)
         self.fin_worker_hits = deque(maxlen=FIN_WORKER_WINDOW)     # (fin_worker_worth: recent tries found them?)
@@ -7165,6 +7168,18 @@ async def main_async(args):
             except Exception:           # a file-system error must not stop the sweeps (or the server)
                 log.exception("session sweep failed")
     sweeper = asyncio.create_task(sessions())
+    MEM_WATCH_S = 30.0
+
+    async def mem_watchdog():
+        while True:
+            await asyncio.sleep(MEM_WATCH_S)
+            load = budget.system_memory_load()
+            if load is not None and load >= budget.MEMORY_LOAD_CEILING:
+                log.warning("system memory high: %d%% in use (>= %d%% ceiling); trimming working set and caches",
+                            load, budget.MEMORY_LOAD_CEILING)
+                budget.maybe_shed(force=True)
+                budget.trim()
+    mem_watcher = asyncio.create_task(mem_watchdog())
     map_srv = None
     if getattr(args, "map_tiles", "on") == "on" and server.imagery is not None:
         try:                        # the world map's tiles, 127.0.0.1 only (a failure only loses the map)
@@ -7200,6 +7215,7 @@ async def main_async(args):
         ticker.cancel()
         lagger.cancel()
         sweeper.cancel()
+        mem_watcher.cancel()
         if map_srv is not None:
             map_srv.close()
         if server.areas is not None:

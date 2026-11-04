@@ -74,6 +74,32 @@ class ShedTest(unittest.TestCase):
                 budget.apply(is_small=False)
                 self.assertEqual(budget.SHED_MB, 0)
 
+    def test_system_memory_load(self):
+        load = budget.system_memory_load()
+        if sys.platform in ("win32", "linux"):
+            self.assertIsNotNone(load)
+            self.assertGreaterEqual(load, 0)
+            self.assertLessEqual(load, 100)
+
+    def test_shed_under_system_pressure(self):
+        # On desktops SHED_MB is 0, but when system load >= 80% it sheds over PRESSURE_SHED_MB
+        budget.SHED_MB = 0
+        with mock.patch.object(budget, "system_memory_load", return_value=85):
+            with mock.patch.object(budget, "memory_mb", return_value=budget.PRESSURE_SHED_MB + 50):
+                self.assertTrue(budget.maybe_shed())
+                self.assertEqual(self.calls, [1])
+
+    def test_no_shed_under_system_pressure_if_below_pressure_ceiling(self):
+        budget.SHED_MB = 0
+        with mock.patch.object(budget, "system_memory_load", return_value=85):
+            with mock.patch.object(budget, "memory_mb", return_value=budget.PRESSURE_SHED_MB - 50):
+                self.assertFalse(budget.maybe_shed())
+                self.assertEqual(self.calls, [])
+
+    def test_trim_cross_platform(self):
+        # Must execute cleanly on the current platform
+        budget.trim()
+
 
 class ClearMemoryTest(unittest.TestCase):
     def test_roadwidth_memo_capped(self):

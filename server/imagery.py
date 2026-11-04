@@ -1501,6 +1501,13 @@ class Imagery:
             used["deshadow"] = relit
         return out, used
 
+    def clear_memory(self):
+        """Drop the in-memory finished and decoded image tiles."""
+        with self._lock:
+            self._fin.clear()
+            self._fin_bytes = 0
+            self._fin_rgb.clear()
+
     def close(self):
         if self.deshadow is not None:
             self.deshadow.close()

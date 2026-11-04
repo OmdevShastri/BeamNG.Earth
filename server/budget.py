@@ -131,6 +131,8 @@ _trimming = False
 SHED_MB = 0
 SMALL_SHED_MB = 1400     # (1200 on a Deck in Manhattan: two road workers dropped every ~15 s, 1206 -> 822 MB, their working set)
 SHED_MIN_S = 90.0        # a worker drops its caches at most this often (a dense city's working set comes straight back)
+MEMORY_LOAD_CEILING = 80 # total physical RAM load percentage (0-100): at or above this, system is under acute pressure
+PRESSURE_SHED_MB = 600   # worker memory threshold when system load >= MEMORY_LOAD_CEILING
 _shedders = []
 shed_count = 0
 _last_shed = None
@@ -139,6 +141,42 @@ _last_shed = None
 def register_shed(fn):
     """fn(): drop a cache of this process (called between jobs, in the worker's own thread)."""
     _shedders.append(fn)
+
+
+def system_memory_load():
+    """Total system physical memory load percentage (0-100), or None if unknown."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            m = MS()
+            m.dwLength = ctypes.sizeof(MS)
+            k32 = ctypes.WinDLL("kernel32")
+            if k32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return int(m.dwMemoryLoad)
+        except Exception:
+            pass
+    elif sys.platform.startswith("linux"):
+        try:
+            total = avail = 0
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        total = int(line.split()[1])
+                    elif line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1])
+            if total > 0:
+                return int(round((1.0 - avail / total) * 100))
+        except (OSError, ValueError):
+            pass
+    return None
 
 
 def memory_mb():
@@ -170,6 +208,8 @@ def memory_mb():
             k32 = ctypes.WinDLL("kernel32")
             k32.GetCurrentProcess.restype = wintypes.HANDLE
             psapi = ctypes.WinDLL("psapi")
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
             if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb):
                 return c.PrivateUsage / 2 ** 20
         except Exception:
@@ -177,19 +217,30 @@ def memory_mb():
     return None
 
 
-def maybe_shed():
-    """Between jobs: the registered caches dropped when this process is over SHED_MB. True when it shed."""
+def maybe_shed(force=False):
+    """Between jobs: the registered caches dropped when this process is over SHED_MB or system memory load >= MEMORY_LOAD_CEILING."""
     global shed_count
-    if not SHED_MB or not _shedders:
+    if not _shedders:
         return False
     import time
     global _last_shed
-    if _last_shed is not None and time.monotonic() - _last_shed < SHED_MIN_S:
+    now = time.monotonic()
+    if not force and _last_shed is not None and now - _last_shed < SHED_MIN_S:
         return False
+
+    load = system_memory_load()
+    is_pressure = load is not None and load >= MEMORY_LOAD_CEILING
+    ceiling = PRESSURE_SHED_MB if is_pressure else SHED_MB
+    if not ceiling and not force:
+        return False
+
     mb = memory_mb()
-    if mb is None or mb < SHED_MB:
+    if mb is None:
         return False
-    _last_shed = time.monotonic()
+    if not force and mb < ceiling:
+        return False
+
+    _last_shed = now
     import gc
     import logging
     for fn in list(_shedders):
@@ -201,23 +252,27 @@ def maybe_shed():
     trim()
     shed_count += 1
     after = memory_mb()
-    logging.getLogger("earthd.worker").info("memory: pid %d at %.0f MB (over %d): caches dropped, now %.0f MB",
-                                            os.getpid(), mb, SHED_MB, after or 0)
+    reason = f"high system load ({load}% >= {MEMORY_LOAD_CEILING}%)" if is_pressure else f"over {ceiling} MB"
+    logging.getLogger("earthd.worker").info("memory: pid %d at %.0f MB (%s): caches dropped, now %.0f MB",
+                                            os.getpid(), mb, reason, after or 0)
     return True
 
 
 def _malloc_small():
-    """Linux (glibc): at most ARENA_MAX malloc arenas, and the freed memory given back every TRIM_S (a thread)."""
+    """At most ARENA_MAX malloc arenas (Linux glibc), and freed memory given back every TRIM_S (Linux glibc & Windows psapi)."""
     global _trimming
-    if not sys.platform.startswith("linux") or _trimming:
+    if _trimming:
         return
-    libc = _libc()
-    if libc is None or not hasattr(libc, "malloc_trim"):
+    if sys.platform.startswith("linux"):
+        libc = _libc()
+        if libc is not None and hasattr(libc, "mallopt"):
+            try:
+                libc.mallopt(-8, ARENA_MAX)         # M_ARENA_MAX
+            except Exception:
+                pass
+    elif sys.platform != "win32":
         return
-    try:
-        libc.mallopt(-8, ARENA_MAX)         # M_ARENA_MAX
-    except Exception:
-        pass
+
     import threading
     import time
 
@@ -225,18 +280,31 @@ def _malloc_small():
         while True:
             time.sleep(TRIM_S)
             try:
-                libc.malloc_trim(0)
+                trim()
             except Exception:
                 return
     _trimming = True
-    threading.Thread(target=loop, daemon=True, name="malloc-trim").start()
+    threading.Thread(target=loop, daemon=True, name="mem-trim").start()
 
 
 def trim():
-    """Give the freed memory back now (glibc; nothing elsewhere)."""
-    libc = _libc() if sys.platform.startswith("linux") else None
-    if libc is not None and hasattr(libc, "malloc_trim"):
-        libc.malloc_trim(0)
+    """Give the freed memory back now (Linux glibc malloc_trim; Windows psapi EmptyWorkingSet)."""
+    if sys.platform.startswith("linux"):
+        libc = _libc() if sys.platform.startswith("linux") else None
+        if libc is not None and hasattr(libc, "malloc_trim"):
+            libc.malloc_trim(0)
+    elif sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32")
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi = ctypes.WinDLL("psapi")
+            psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+            psapi.EmptyWorkingSet.restype = wintypes.BOOL
+            psapi.EmptyWorkingSet(k32.GetCurrentProcess())
+        except Exception:
+            pass
 
 
 # Windows has no niceness: priority classes. The server's own (earthd --nice, default 10) is "below normal"; its workers
